@@ -26,12 +26,16 @@ from rich.live import Live
 
 
 class StatusTree:
-    """Thread-safe live-updating tree of current state using rich.Live."""
+    """Thread-safe live-updating tree of current state using rich.Live.
+
+    Messages are stored per numeric depth as a list of (text, style) tuples.
+    style is any valid rich style name (e.g., 'blue'); None means default style.
+    """
 
     def __init__(self) -> None:
         self.console = Console()
         self.lock = threading.Lock()
-        self.messages: dict[int, list[str]] = defaultdict(list)
+        self.messages: dict[int, list[tuple[str, str | None]]] = defaultdict(list)
         self.header: str = "LaYER"
         self._live: Live | None = None
 
@@ -55,24 +59,23 @@ class StatusTree:
             if self._live:
                 self._live.update(self._render())
 
-    def add(self, depth: int, message: str) -> None:
-        """Add a message under a numeric depth. Use depth=-1 for top-level info."""
+    def add(self, depth: int, message: str, style: str | None = None) -> None:
+        """Add a message under a numeric depth. style is a rich style (e.g. 'blue')."""
         with self.lock:
-            self.messages[depth].append(message)
+            self.messages[depth].append((message, style))
             if self._live:
                 self._live.update(self._render())
 
     def _render(self) -> Tree:
         root = Tree(self.header)
-        # top-level messages (depth -1)
-        if -1 in self.messages:
-            meta = root.add("Meta")
-            for m in self.messages[-1]:
-                meta.add(m)
+        # do NOT render top-level meta (-1) per user preference
         for depth in sorted(k for k in self.messages.keys() if k >= 0):
             node = root.add(f"Layer {depth}")
-            for m in self.messages[depth]:
-                node.add(m)
+            for text, style in self.messages[depth]:
+                if style:
+                    node.add(text, style=style)
+                else:
+                    node.add(text)
         return root
 
 
@@ -516,7 +519,11 @@ def gather_proposals(
                     subtasks=subtasks,
                 )
             )
-            ui.add(depth, f"Proposal {len(proposals)} [{be}]: {proposals[-1].plan[:SUMMARY_MAX_LEN]}{'...' if len(proposals[-1].plan) > SUMMARY_MAX_LEN else ''}")
+            ui.add(
+                depth,
+                f"Proposal {len(proposals)} [{be}]: {proposals[-1].plan[:SUMMARY_MAX_LEN]}{'...' if len(proposals[-1].plan) > SUMMARY_MAX_LEN else ''}",
+                style="blue",
+            )
         finally:
             pool.release()
 
@@ -1010,22 +1017,15 @@ def run(
     )
     pool = get_pool(cfg)
     ui.start()
+    # header shows basic startup info; do not populate a meta section
     ui.set_header(
-        f"LaYER starting: depth={cfg.max_depth}, N={cfg.min_competitors}, M={cfg.min_selected}, max_agents={cfg.max_agents}"
+        f"LaYER starting: depth={cfg.max_depth}, N={cfg.min_competitors}, M={cfg.min_selected}, max_agents={cfg.max_agents} | Task: {task}"
     )
-    ui.add(-1, "Agent pools:")
-    for d in sorted(cfg.layer_pools):
-        cmds = cfg.layer_pools[d].backends
-        ui.add(-1, f"Layer {d}: {len(cmds)} backend(s)")
-        for b in cmds:
-            ui.add(-1, f"- {b}")
-    ui.add(-1, f"Task: {task}")
 
     try:
         result = run_layer(cfg, pool, task)
-        ui.add(-1, "=" * 60)
-        ui.add(-1, "Final result:")
-        ui.add(-1, result)
+        # show final result in header (concise)
+        ui.set_header(ui.header + f" | Final result: {result[:SUMMARY_MAX_LEN]}{'...' if len(result) > SUMMARY_MAX_LEN else ''}")
     finally:
         ui.stop()
 
