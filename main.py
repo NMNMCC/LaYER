@@ -232,19 +232,36 @@ def call_agent(
     cwd: str | None = None,
     backend: AgentBackend | None = None,
 ) -> str:
-    """Run a sub-agent and return its stdout."""
+    """Run a sub-agent and return its stdout. Adds UI diagnostics on start/failure.
+
+    Note: depth is used to place diagnostic messages in the status tree.
+    """
     be = backend or cfg.pick_backend(depth)
     cmd_list = be.render(prompt)
-    result = subprocess.run(
-        cmd_list,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-        timeout=600,
-    )
+    ui.add(depth, f"Starting agent [{be}]...")
+    try:
+        result = subprocess.run(
+            cmd_list,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=600,
+        )
+    except FileNotFoundError as e:
+        ui.add(depth, f"Agent command not found: {e}")
+        raise
+    except subprocess.TimeoutExpired as e:
+        ui.add(depth, f"Agent [{be}] timed out after {e.timeout}s")
+        raise
+
     if result.returncode != 0:
-        raise RuntimeError(f"Agent [{be}] failed: {result.stderr[:500]}")
-    return result.stdout.strip()
+        stderr_excerpt = (result.stderr or "")[:400]
+        ui.add(depth, f"Agent [{be}] failed (rc={result.returncode}): {stderr_excerpt}")
+        raise RuntimeError(f"Agent [{be}] failed: {stderr_excerpt}")
+
+    stdout_excerpt = (result.stdout or "").strip()
+    ui.add(depth, f"Agent [{be}] finished, output len={len(stdout_excerpt)}")
+    return stdout_excerpt
 
 
 # ---------------------------------------------------------------------------
