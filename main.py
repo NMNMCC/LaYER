@@ -7,6 +7,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+import os
 import shutil
 from textwrap import dedent
 
@@ -204,11 +205,48 @@ def create_worktree(tag: str) -> Path:
 
 
 def remove_worktree(wt_dir: Path):
-    subprocess.run(
-        ["git", "worktree", "remove", "--force", str(wt_dir)], capture_output=True
-    )
-    branch = wt_dir.name
-    subprocess.run(["git", "branch", "-D", branch], capture_output=True)
+    """Remove a git worktree and delete its branch, then fully delete the directory.
+
+    Safety: only remove directories under the repo's .layer-worktrees directory.
+    """
+    try:
+        root = repo_root()
+        base = root.parent / ".layer-worktrees"
+        # Ensure target is under base to avoid accidental deletion
+        try:
+            wt_real = wt_dir.resolve()
+            base_real = base.resolve()
+            if not str(wt_real).startswith(str(base_real)):
+                # Not under managed worktrees dir — do not recursively delete; still attempt git cleanup
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(wt_dir)], capture_output=True
+                )
+                subprocess.run(["git", "branch", "-D", wt_dir.name], capture_output=True)
+                return
+        except Exception:
+            # If resolve fails, be conservative and avoid recursive deletion
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(wt_dir)], capture_output=True
+            )
+            subprocess.run(["git", "branch", "-D", wt_dir.name], capture_output=True)
+            return
+
+        # Attempt normal git cleanup
+        subprocess.run([
+            "git",
+            "worktree",
+            "remove",
+            "--force",
+            str(wt_dir),
+        ], capture_output=True)
+        subprocess.run(["git", "branch", "-D", wt_dir.name], capture_output=True)
+    finally:
+        # Ensure directory is removed from filesystem
+        try:
+            if wt_dir.exists():
+                shutil.rmtree(wt_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def merge_worktree(wt_dir: Path):
