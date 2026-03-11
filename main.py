@@ -7,6 +7,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+import shutil
 from textwrap import dedent
 
 import typer
@@ -634,15 +635,61 @@ def merge_results(
     if not pool.acquire():
         return successes[0]
     try:
-        merged_output = call_agent(cfg, prompt, depth=depth)
+        # Create a dedicated merge worktree for the merge agent
+        merge_tag = f"d{depth}-merge-{uuid.uuid4().hex[:6]}"
+        merge_wt = create_worktree(merge_tag)
+        worktrees_dir = merge_wt / ".worktrees"
+        worktrees_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy each successful worktree into the merge worktree under .worktrees/<id>
+        for r in successes:
+            dest = worktrees_dir / r.agent_id
+            try:
+                # copy content but skip .git directory to avoid moving git metadata
+                shutil.copytree(r.worktree, dest, ignore=shutil.ignore_patterns('.git'))
+            except Exception:
+                # best-effort: fall back to file-by-file copy
+                try:
+                    dest.mkdir(parents=True, exist_ok=True)
+                    for src_path in r.worktree.rglob('*'):
+                        rel = src_path.relative_to(r.worktree)
+                        target = dest / rel
+                        if src_path.is_dir():
+                            target.mkdir(parents=True, exist_ok=True)
+                        else:
+                            if src_path.name == '.git':
+                                continue
+                            try:
+                                shutil.copy2(src_path, target)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            # Remove the original worktree (unregister and delete branch)
+            try:
+                remove_worktree(r.worktree)
+            except Exception:
+                # ignore failures to remove; merge agent will still have copies
+                pass
+
+        # Run merge agent in the merge worktree so it can inspect .worktrees/
+        merged_output = call_agent(cfg, prompt, depth=depth, cwd=str(merge_wt))
+
+        # Clean up the aggregated copies after merge
+        try:
+            shutil.rmtree(worktrees_dir)
+        except Exception:
+            pass
+
         return ExecutionResult(
-            agent_id=f"d{depth}-merge-{uuid.uuid4().hex[:6]}",
+            agent_id=merge_tag,
             proposal=Proposal(
                 agent_id="merge",
                 plan="Merged solution from multiple directions",
                 key_details="",
             ),
-            worktree=successes[0].worktree,
+            worktree=merge_wt,
             output=merged_output,
             success=True,
             call_tree=call_tree,
