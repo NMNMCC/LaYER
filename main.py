@@ -15,6 +15,68 @@ import typer
 
 app = typer.Typer(help="LaYER — LaYERed Agent Yielding Evaluated Results")
 
+# --- Rich-based status tree UI ------------------------------------------------
+from collections import defaultdict
+from rich.console import Console
+from rich.tree import Tree
+from rich.live import Live
+
+
+class StatusTree:
+    """Thread-safe live-updating tree of current state using rich.Live."""
+
+    def __init__(self) -> None:
+        self.console = Console()
+        self.lock = threading.Lock()
+        self.messages: dict[int, list[str]] = defaultdict(list)
+        self.header: str = "LaYER"
+        self._live: Live | None = None
+
+    def start(self) -> None:
+        with self.lock:
+            if self._live is None:
+                self._live = Live(self._render(), console=self.console, refresh_per_second=4)
+                self._live.__enter__()
+
+    def stop(self) -> None:
+        with self.lock:
+            if self._live is not None:
+                try:
+                    self._live.__exit__(None, None, None)
+                finally:
+                    self._live = None
+
+    def set_header(self, text: str) -> None:
+        with self.lock:
+            self.header = text
+            if self._live:
+                self._live.update(self._render())
+
+    def add(self, depth: int, message: str) -> None:
+        """Add a message under a numeric depth. Use depth=-1 for top-level info."""
+        with self.lock:
+            self.messages[depth].append(message)
+            if self._live:
+                self._live.update(self._render())
+
+    def _render(self) -> Tree:
+        root = Tree(self.header)
+        # top-level messages (depth -1)
+        if -1 in self.messages:
+            meta = root.add("Meta")
+            for m in self.messages[-1]:
+                meta.add(m)
+        for depth in sorted(k for k in self.messages.keys() if k >= 0):
+            node = root.add(f"Layer {depth}")
+            for m in self.messages[depth]:
+                node.add(m)
+        return root
+
+
+# module-level UI instance
+ui = StatusTree()
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -399,9 +461,7 @@ def gather_proposals(
     proposals: list[Proposal] = []
     for i in range(cfg.min_competitors * 3):  # hard upper bound
         if not pool.acquire():
-            print(
-                f"  [depth={depth}] Agent pool exhausted, stopping proposals at {len(proposals)}"
-            )
+            ui.add(depth, f"Agent pool exhausted, stopping proposals at {len(proposals)}")
             break
         try:
             prior = (
@@ -437,13 +497,11 @@ def gather_proposals(
                 if not isinstance(subtasks, list):
                     subtasks = [str(subtasks)]
             if data is None:
-                print(f"  [depth={depth}] Agent {i} returned invalid JSON, skipping")
+                ui.add(depth, f"Agent {i} returned invalid JSON, skipping")
                 continue
 
             if not data.get("is_novel", True) and len(proposals) >= cfg.min_competitors:
-                print(
-                    f"  [depth={depth}] Proposals converged after {len(proposals)} agents"
-                )
+                ui.add(depth, f"Proposals converged after {len(proposals)} agents")
                 break
 
             proposals.append(
@@ -455,9 +513,7 @@ def gather_proposals(
                     subtasks=subtasks,
                 )
             )
-            print(
-                f"  [depth={depth}] Proposal {len(proposals)} [{be}]: {proposals[-1].plan[:80]}..."
-            )
+            ui.add(depth, f"Proposal {len(proposals)} [{be}]: {proposals[-1].plan[:80]}...")
         finally:
             pool.release()
 
@@ -530,9 +586,7 @@ def execute_proposal(
     """Phase 3: execute a single proposal in its own worktree."""
     tag = proposal.agent_id
     wt = create_worktree(tag)
-    print(
-        f"  [depth={depth}] Executing {proposal.agent_id} [{proposal.backend}] in {wt}"
-    )
+    ui.add(depth, f"Executing {proposal.agent_id} [{proposal.backend}] in {wt}")
     try:
         if depth + 1 < cfg.max_depth:
             # Recurse — support explicit subtasks dispatched to the next layer
@@ -776,8 +830,8 @@ def run_layer(
     if call_tree is None:
         call_tree = CallTree()
 
-    indent = "  " * depth
-    print(f"{indent}[Layer {depth}] Task: {task[:100]}...")
+    # show task in the status tree
+    ui.add(depth, f"Task: {task[:100]}...")
 
     full_task = (
         f"{task}\n\nAdditional context from upper layer:\n{context}"
@@ -788,7 +842,7 @@ def run_layer(
     # Phase 1: gather proposals
     proposals = gather_proposals(cfg, pool, full_task, depth, call_tree)
     if not proposals:
-        print(f"{indent}[Layer {depth}] No proposals generated, executing directly")
+        ui.add(depth, "No proposals generated, executing directly")
         if not pool.acquire():
             return "pool exhausted"
         try:
@@ -813,9 +867,7 @@ def run_layer(
             finally:
                 pool.release()
             if "yes" in answer:
-                print(
-                    f"{indent}[Layer {depth}] All proposals converged, executing directly"
-                )
+                ui.add(depth, "All proposals converged, executing directly")
                 prompt = dedent(f"""\
                     Execute this task directly. Follow this plan:
                     Task: {full_task}
@@ -832,9 +884,7 @@ def run_layer(
     directions = synthesize_directions(
         cfg, pool, full_task, proposals, depth, call_tree
     )
-    print(
-        f"{indent}[Layer {depth}] Synthesized {len(directions)} directions for execution"
-    )
+    ui.add(depth, f"Synthesized {len(directions)} directions for execution")
 
     # Phase 3: execute in parallel worktrees
     results: list[ExecutionResult] = []
@@ -851,14 +901,12 @@ def run_layer(
     # Phase 4: merge
     merged = merge_results(cfg, pool, full_task, results, depth, call_tree)
     if merged is None:
-        print(f"{indent}[Layer {depth}] All executions failed")
+        ui.add(depth, "All executions failed")
         for r in results:
             remove_worktree(r.worktree)
         return "all executions failed"
 
-    print(
-        f"{indent}[Layer {depth}] Merged {len([r for r in results if r.success])} results"
-    )
+    ui.add(depth, f"Merged {len([r for r in results if r.success])} results")
 
     # Clean up all worktrees, keep merged result
     for r in results:
@@ -958,22 +1006,25 @@ def run(
         layer_pools=layer_pools,
     )
     pool = get_pool(cfg)
-    print(
-        f"LaYER starting: depth={cfg.max_depth}, N={cfg.min_competitors}, "
-        f"M={cfg.min_selected}, max_agents={cfg.max_agents}"
+    ui.start()
+    ui.set_header(
+        f"LaYER starting: depth={cfg.max_depth}, N={cfg.min_competitors}, M={cfg.min_selected}, max_agents={cfg.max_agents}"
     )
-    print("Agent pools:")
+    ui.add(-1, "Agent pools:")
     for d in sorted(cfg.layer_pools):
         cmds = cfg.layer_pools[d].backends
-        print(f"  Layer {d}: {len(cmds)} backend(s)")
+        ui.add(-1, f"Layer {d}: {len(cmds)} backend(s)")
         for b in cmds:
-            print(f"    - {b}")
-    print(f"Task: {task}\n")
+            ui.add(-1, f"- {b}")
+    ui.add(-1, f"Task: {task}")
 
-    result = run_layer(cfg, pool, task)
-    print(f"\n{'=' * 60}")
-    print("Final result:")
-    print(result)
+    try:
+        result = run_layer(cfg, pool, task)
+        ui.add(-1, "=" * 60)
+        ui.add(-1, "Final result:")
+        ui.add(-1, result)
+    finally:
+        ui.stop()
 
 
 if __name__ == "__main__":
