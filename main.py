@@ -1,7 +1,6 @@
-from __future__ import annotations
-
 import itertools
 import json
+import shlex
 import subprocess
 import threading
 import uuid
@@ -23,10 +22,22 @@ app = typer.Typer(help="LaYER — LaYERed Agent Yielding Evaluated Results")
 class AgentBackend:
     """A single agent backend — a command template with {prompt} placeholder."""
 
-    cmd: str  # e.g. "copilot -s --model claude-sonnet-4-20250514 -p {prompt}"
+    cmd: str
 
-    def render(self, prompt: str) -> str:
-        return self.cmd.format(prompt=json.dumps(prompt))
+    def render(self, prompt: str) -> list[str]:
+        if "{prompt}" not in self.cmd:
+            raise ValueError(f"Command must contain {{prompt}}: {self.cmd}")
+        start = self.cmd.find("{prompt}")
+        end = start + len("{prompt}")
+        prefix = self.cmd[:start].rstrip()
+        suffix = self.cmd[end:].lstrip()
+        cmd_list = []
+        if prefix:
+            cmd_list = shlex.split(prefix)
+        cmd_list.append(prompt)
+        if suffix:
+            cmd_list.extend(shlex.split(suffix))
+        return cmd_list
 
     def __str__(self) -> str:
         return self.cmd
@@ -55,7 +66,7 @@ class LayerPool:
         return True
 
 
-DEFAULT_CMD = "copilot -s -p {prompt}"
+DEFAULT_CMD = "opencode run {prompt}"
 
 
 @dataclass
@@ -121,6 +132,25 @@ def get_pool(cfg: Config) -> AgentPool:
 
 
 # ---------------------------------------------------------------------------
+# Helpers — JSON extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_json(raw: str, expect_list: bool = False):
+    """Extract JSON from agent response, handling extra text."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        open_char = "[" if expect_list else "{"
+        close_char = "]" if expect_list else "}"
+        start = raw.find(open_char)
+        end = raw.rfind(close_char) + 1
+        if start >= 0 and end > start:
+            return json.loads(raw[start:end])
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Helpers — call copilot
 # ---------------------------------------------------------------------------
 
@@ -134,10 +164,9 @@ def call_agent(
 ) -> str:
     """Run a sub-agent and return its stdout."""
     be = backend or cfg.pick_backend(depth)
-    cmd = be.render(prompt)
+    cmd_list = be.render(prompt)
     result = subprocess.run(
-        cmd,
-        shell=True,
+        cmd_list,
         capture_output=True,
         text=True,
         cwd=cwd,
@@ -203,16 +232,128 @@ class Proposal:
 
 
 @dataclass
+class CallNode:
+    """A node in the agent call tree."""
+
+    task: str
+    depth: int
+    agent_id: str | None = None
+    plan: str | None = None
+    backend: str | None = None
+    children: list["CallNode"] = field(default_factory=list)
+    output: str | None = None
+    success: bool | None = None
+
+    def render_tree(self, indent: int = 0) -> str:
+        """Render the call tree as a human-readable string."""
+        prefix = "  " * indent
+        lines = []
+        node_desc = f"[Depth {self.depth}] {self.task[:80]}{'...' if len(self.task) > 80 else ''}"
+        if self.agent_id:
+            node_desc = f"{self.agent_id}: {node_desc}"
+        if self.backend:
+            node_desc = f"{node_desc} [{self.backend}]"
+        lines.append(f"{prefix}{node_desc}")
+        if self.plan:
+            lines.append(
+                f"{prefix}  Plan: {self.plan[:100]}{'...' if len(self.plan) > 100 else ''}"
+            )
+        if self.output:
+            lines.append(
+                f"{prefix}  Output: {self.output[:100]}{'...' if len(self.output) > 100 else ''}"
+            )
+        for child in self.children:
+            lines.extend(child.render_tree(indent + 1).split("\n"))
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict:
+        """Convert to dict for JSON serialization."""
+        return {
+            "task": self.task,
+            "depth": self.depth,
+            "agent_id": self.agent_id,
+            "plan": self.plan,
+            "backend": self.backend,
+            "children": [c.to_dict() for c in self.children],
+            "output": self.output,
+            "success": self.success,
+        }
+
+
+@dataclass
+class CallTree:
+    """The full call tree with a reference to the current node."""
+
+    root: CallNode = field(default_factory=lambda: CallNode(task="<root>", depth=-1))
+    current: CallNode = field(default=None)  # type: ignore
+
+    def __post_init__(self):
+        if self.current is None:
+            self.current = self.root
+
+    def spawn_child(self, task: str, depth: int) -> "CallTree":
+        """Create a new tree view with a child as current."""
+        child = CallNode(task=task, depth=depth)
+        self.current.children.append(child)
+        return CallTree(root=self.root, current=child)
+
+    def mark_complete(
+        self,
+        agent_id: str | None = None,
+        plan: str | None = None,
+        backend: str | None = None,
+        output: str | None = None,
+        success: bool | None = None,
+    ):
+        """Mark the current node with execution details."""
+        if agent_id is not None:
+            self.current.agent_id = agent_id
+        if plan is not None:
+            self.current.plan = plan
+        if backend is not None:
+            self.current.backend = backend
+        if output is not None:
+            self.current.output = output
+        if success is not None:
+            self.current.success = success
+
+    def get_context_prompt(self) -> str:
+        """Generate a prompt describing the call tree for child agents."""
+        if self.current == self.root:
+            return ""
+        return self._render_for_agent(self.root, 0)
+
+    def _render_for_agent(self, node: CallNode, indent: int) -> str:
+        """Render tree in a format suitable for agent consumption."""
+        lines = []
+        prefix = "  " * indent
+        if node.depth >= 0:
+            status = ""
+            if node.success is not None:
+                status = "✓" if node.success else "✗"
+            line = f"{prefix}{status} [Depth {node.depth}] Task: {node.task}"
+            if node.plan:
+                line += f"\n{prefix}  Plan: {node.plan}"
+            if node.output:
+                line += f"\n{prefix}  Result: {node.output[:200]}"
+            lines.append(line)
+        for child in node.children:
+            lines.extend(self._render_for_agent(child, indent + 1).split("\n"))
+        return "\n".join(lines)
+
+
+@dataclass
 class ExecutionResult:
     agent_id: str
     proposal: Proposal
     worktree: Path
     output: str
     success: bool
+    call_tree: CallTree | None = None
 
 
 def gather_proposals(
-    cfg: Config, pool: AgentPool, task: str, depth: int
+    cfg: Config, pool: AgentPool, task: str, depth: int, call_tree: CallTree
 ) -> list[Proposal]:
     """Phase 1: sequentially collect competing proposals until convergence."""
     proposals: list[Proposal] = []
@@ -230,10 +371,11 @@ def gather_proposals(
                 or "(none yet)"
             )
 
+            tree_context = call_tree.get_context_prompt()
             prompt = dedent(f"""\
                 You are a competing agent bidding on a task. You MUST respond with valid JSON only.
                 Task: {task}
-
+                {f"\n\n=== CALL TREE (Parent Context) ===\n{tree_context}\n=== END CALL TREE ===\n" if tree_context else ""}
                 Previous proposals from other agents:
                 {prior}
 
@@ -245,20 +387,10 @@ def gather_proposals(
             """)
             be = cfg.pick_backend(depth)
             raw = call_agent(cfg, prompt, depth=depth, backend=be)
-            # Extract JSON from response
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                # Try to find JSON in the output
-                start = raw.find("{")
-                end = raw.rfind("}") + 1
-                if start >= 0 and end > start:
-                    data = json.loads(raw[start:end])
-                else:
-                    print(
-                        f"  [depth={depth}] Agent {i} returned invalid JSON, skipping"
-                    )
-                    continue
+            data = extract_json(raw)
+            if data is None:
+                print(f"  [depth={depth}] Agent {i} returned invalid JSON, skipping")
+                continue
 
             if not data.get("is_novel", True) and len(proposals) >= cfg.min_competitors:
                 print(
@@ -284,7 +416,12 @@ def gather_proposals(
 
 
 def select_proposals(
-    cfg: Config, pool: AgentPool, task: str, proposals: list[Proposal], depth: int
+    cfg: Config,
+    pool: AgentPool,
+    task: str,
+    proposals: list[Proposal],
+    depth: int,
+    call_tree: CallTree,
 ) -> list[Proposal]:
     """Phase 2: upper agent selects M diverse proposals."""
     if len(proposals) <= cfg.min_selected:
@@ -293,10 +430,11 @@ def select_proposals(
     summary = "\n---\n".join(
         f"ID: {p.agent_id}\nPlan: {p.plan}\nDetails: {p.key_details}" for p in proposals
     )
+    tree_context = call_tree.get_context_prompt()
     prompt = dedent(f"""\
         You are a manager agent selecting the best proposals for a task.
         Task: {task}
-
+        {f"\n\n=== CALL TREE (Parent Context) ===\n{tree_context}\n=== END CALL TREE ===\n" if tree_context else ""}
         Proposals:
         {summary}
 
@@ -309,15 +447,9 @@ def select_proposals(
         return proposals[: cfg.min_selected]
     try:
         raw = call_agent(cfg, prompt, depth=depth)
-        try:
-            ids = json.loads(raw)
-        except json.JSONDecodeError:
-            start = raw.find("[")
-            end = raw.rfind("]") + 1
-            if start >= 0 and end > start:
-                ids = json.loads(raw[start:end])
-            else:
-                return proposals[: cfg.min_selected]
+        ids = extract_json(raw, expect_list=True)
+        if ids is None:
+            return proposals[: cfg.min_selected]
 
         id_set = set(ids)
         selected = [p for p in proposals if p.agent_id in id_set]
@@ -329,7 +461,12 @@ def select_proposals(
 
 
 def execute_proposal(
-    cfg: Config, pool: AgentPool, task: str, proposal: Proposal, depth: int
+    cfg: Config,
+    pool: AgentPool,
+    task: str,
+    proposal: Proposal,
+    depth: int,
+    call_tree: CallTree,
 ) -> ExecutionResult:
     """Phase 3: execute a single proposal in its own worktree."""
     tag = proposal.agent_id
@@ -340,7 +477,19 @@ def execute_proposal(
     try:
         if depth + 1 < cfg.max_depth:
             # Recurse
-            output = run_layer(cfg, pool, task, proposal.plan, depth + 1, cwd=str(wt))
+            child_tree = call_tree.spawn_child(task=task, depth=depth + 1)
+            child_tree.mark_complete(
+                agent_id=tag, plan=proposal.plan, backend=str(proposal.backend)
+            )
+            output = run_layer(
+                cfg,
+                pool,
+                task,
+                proposal.plan,
+                depth + 1,
+                cwd=str(wt),
+                call_tree=child_tree,
+            )
         else:
             # Leaf — actually do the work
             prompt = dedent(f"""\
@@ -356,13 +505,23 @@ def execute_proposal(
                 output = call_agent(cfg, prompt, cwd=str(wt), backend=proposal.backend)
             finally:
                 pool.release()
-        return ExecutionResult(tag, proposal, wt, output[:2000], True)
+        return ExecutionResult(
+            tag, proposal, wt, output[:2000], True, call_tree=call_tree
+        )
     except Exception as e:
-        return ExecutionResult(tag, proposal, wt, str(e)[:500], False)
+        call_tree.mark_complete(success=False)
+        return ExecutionResult(
+            tag, proposal, wt, str(e)[:500], False, call_tree=call_tree
+        )
 
 
 def evaluate_results(
-    cfg: Config, pool: AgentPool, task: str, results: list[ExecutionResult], depth: int
+    cfg: Config,
+    pool: AgentPool,
+    task: str,
+    results: list[ExecutionResult],
+    depth: int,
+    call_tree: CallTree,
 ) -> ExecutionResult | None:
     """Phase 4: upper agent picks the best result."""
     successes = [r for r in results if r.success]
@@ -375,10 +534,11 @@ def evaluate_results(
         f"ID: {r.agent_id}\nPlan: {r.proposal.plan}\nOutput (excerpt): {r.output[:500]}"
         for r in successes
     )
+    tree_context = call_tree.get_context_prompt()
     prompt = dedent(f"""\
         You are an evaluator agent. Pick the best result for this task.
         Task: {task}
-
+        {f"\n\n=== CALL TREE (Parent Context) ===\n{tree_context}\n=== END CALL TREE ===\n" if tree_context else ""}
         Results:
         {summary}
 
@@ -403,8 +563,12 @@ def run_layer(
     context: str = "",
     depth: int = 0,
     cwd: str | None = None,
+    call_tree: CallTree | None = None,
 ) -> str:
     """Main recursive entry: decompose → compete → execute → evaluate."""
+    if call_tree is None:
+        call_tree = CallTree()
+
     indent = "  " * depth
     print(f"{indent}[Layer {depth}] Task: {task[:100]}...")
 
@@ -415,7 +579,7 @@ def run_layer(
     )
 
     # Phase 1: gather proposals
-    proposals = gather_proposals(cfg, pool, full_task, depth)
+    proposals = gather_proposals(cfg, pool, full_task, depth, call_tree)
     if not proposals:
         print(f"{indent}[Layer {depth}] No proposals generated, executing directly")
         if not pool.acquire():
@@ -457,21 +621,23 @@ def run_layer(
                         pool.release()
 
     # Phase 2: select
-    selected = select_proposals(cfg, pool, full_task, proposals, depth)
+    selected = select_proposals(cfg, pool, full_task, proposals, depth, call_tree)
     print(f"{indent}[Layer {depth}] Selected {len(selected)} proposals for execution")
 
     # Phase 3: execute in parallel worktrees
     results: list[ExecutionResult] = []
     with ThreadPoolExecutor(max_workers=len(selected)) as executor:
         futures = {
-            executor.submit(execute_proposal, cfg, pool, full_task, p, depth): p
+            executor.submit(
+                execute_proposal, cfg, pool, full_task, p, depth, call_tree
+            ): p
             for p in selected
         }
         for f in as_completed(futures):
             results.append(f.result())
 
     # Phase 4: evaluate
-    best = evaluate_results(cfg, pool, full_task, results, depth)
+    best = evaluate_results(cfg, pool, full_task, results, depth, call_tree)
     if best is None:
         print(f"{indent}[Layer {depth}] All executions failed")
         for r in results:
@@ -498,7 +664,6 @@ def parse_agent_spec(spec: str) -> tuple[list[int], AgentBackend]:
     """Parse 'depth=command template' into (depths, AgentBackend).
 
     Format: "DEPTH=CMD" or "DEPTH_RANGE=CMD" where CMD contains {prompt}.
-    If no "DEPTH=" prefix, defaults to depth 0.
 
     Depth can be:
         - Single value: "0=CMD" -> [0]
@@ -507,10 +672,9 @@ def parse_agent_spec(spec: str) -> tuple[list[int], AgentBackend]:
         - Mixed: "0,2-4=CMD" -> [0, 2, 3, 4]
 
     Examples:
-        "0=copilot -s --model claude-opus-4-20250514 -p {prompt}"
-        "0-2=copilot -s --model claude-sonnet-4-20250514 -p {prompt}"
-        "1,3=codex --full-auto -q -p {prompt}"
-        "copilot -s -p {prompt}"     (implies depth=0)
+        "0=opencode run -m claude {prompt}"
+        "0-2=opencode run -m sonnet {prompt}"
+        "opencode run {prompt}"     (implies depth=0)
     """
 
     def parse_depths(prefix: str) -> list[int]:
@@ -551,9 +715,9 @@ def run(
         "--agent",
         "-a",
         help='Per-layer agent spec: "DEPTH=CMD" or just "CMD" (depth 0). '
-        "{prompt} is the placeholder. Repeatable. "
-        'Example: -a "0=copilot -s --model opus -p {prompt}" '
-        '-a "1=copilot -s --model sonnet -p {prompt}"',
+        "{prompt} placeholder will be passed as final argument. "
+        'Example: -a "0=opencode run -m opus {prompt}" '
+        '-a "1=opencode run -m sonnet {prompt}"',
     ),
     max_depth: int = typer.Option(3, help="Maximum recursion depth"),
     min_competitors: int = typer.Option(3, "-n", help="Minimum competing proposals"),
@@ -582,7 +746,7 @@ def run(
     pool = get_pool(cfg)
     print(
         f"LaYER starting: depth={cfg.max_depth}, N={cfg.min_competitors}, "
-        f"M={cfg.min_selected}, m    ax_agents={cfg.max_agents}"
+        f"M={cfg.min_selected}, max_agents={cfg.max_agents}"
     )
     print("Agent pools:")
     for d in sorted(cfg.layer_pools):
