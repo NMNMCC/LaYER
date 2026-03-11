@@ -641,44 +641,71 @@ def merge_results(
         worktrees_dir = merge_wt / ".worktrees"
         worktrees_dir.mkdir(parents=True, exist_ok=True)
 
-        # Copy each successful worktree into the merge worktree under .worktrees/<id>
+        # Link each successful worktree into the merge worktree under .worktrees/<id>
+        # Use symlinks to avoid copying heavy directories (node_modules etc.) and preserve filesystem semantics.
+        created_symlinks: list[Path] = []
         for r in successes:
             dest = worktrees_dir / r.agent_id
             try:
-                # copy content but skip .git directory to avoid moving git metadata
-                shutil.copytree(r.worktree, dest, ignore=shutil.ignore_patterns('.git'))
-            except Exception:
-                # best-effort: fall back to file-by-file copy
+                # Create a relative symlink when possible
                 try:
-                    dest.mkdir(parents=True, exist_ok=True)
-                    for src_path in r.worktree.rglob('*'):
-                        rel = src_path.relative_to(r.worktree)
-                        target = dest / rel
-                        if src_path.is_dir():
-                            target.mkdir(parents=True, exist_ok=True)
-                        else:
-                            if src_path.name == '.git':
-                                continue
-                            try:
-                                shutil.copy2(src_path, target)
-                            except Exception:
-                                pass
+                    rel_target = os.path.relpath(r.worktree, start=worktrees_dir)
+                    dest.symlink_to(rel_target)
                 except Exception:
-                    pass
-
-            # Remove the original worktree (unregister and delete branch)
-            try:
-                remove_worktree(r.worktree)
+                    # fallback to absolute symlink
+                    dest.symlink_to(r.worktree)
+                created_symlinks.append(dest)
             except Exception:
-                # ignore failures to remove; merge agent will still have copies
-                pass
+                # If symlink fails, fall back to best-effort copy of files (excluding .git)
+                try:
+                    shutil.copytree(r.worktree, dest, ignore=shutil.ignore_patterns('.git'))
+                except Exception:
+                    try:
+                        dest.mkdir(parents=True, exist_ok=True)
+                        for src_path in r.worktree.rglob('*'):
+                            rel = src_path.relative_to(r.worktree)
+                            target = dest / rel
+                            if src_path.is_dir():
+                                target.mkdir(parents=True, exist_ok=True)
+                            else:
+                                if src_path.name == '.git':
+                                    continue
+                                try:
+                                    shutil.copy2(src_path, target)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
 
         # Run merge agent in the merge worktree so it can inspect .worktrees/
         merged_output = call_agent(cfg, prompt, depth=depth, cwd=str(merge_wt))
 
-        # Clean up the aggregated copies after merge
+        # After merge, attempt to unregister/remove original worktrees and clean up symlinks/copies
+        for r in successes:
+            try:
+                remove_worktree(r.worktree)
+            except Exception:
+                # ignore failures; best-effort cleanup
+                pass
+
+        # Remove symlinks or copied directories under .worktrees
+        for entry in worktrees_dir.iterdir():
+            try:
+                if entry.is_symlink():
+                    entry.unlink()
+                elif entry.is_dir():
+                    shutil.rmtree(entry)
+                else:
+                    try:
+                        entry.unlink()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Finally, remove the .worktrees directory itself
         try:
-            shutil.rmtree(worktrees_dir)
+            worktrees_dir.rmdir()
         except Exception:
             pass
 
