@@ -415,7 +415,7 @@ def gather_proposals(
     return proposals
 
 
-def select_proposals(
+def synthesize_directions(
     cfg: Config,
     pool: AgentPool,
     task: str,
@@ -423,7 +423,7 @@ def select_proposals(
     depth: int,
     call_tree: CallTree,
 ) -> list[Proposal]:
-    """Phase 2: upper agent selects M diverse proposals."""
+    """Phase 2: synthesize M distinct directions from proposals."""
     if len(proposals) <= cfg.min_selected:
         return proposals
 
@@ -432,30 +432,46 @@ def select_proposals(
     )
     tree_context = call_tree.get_context_prompt()
     prompt = dedent(f"""\
-        You are a manager agent selecting the best proposals for a task.
+        You are a manager agent synthesizing distinct execution directions.
         Task: {task}
         {f"\n\n=== CALL TREE (Parent Context) ===\n{tree_context}\n=== END CALL TREE ===\n" if tree_context else ""}
-        Proposals:
+        Proposals collected:
         {summary}
 
-        Select at least {cfg.min_selected} proposals that are most promising AND maximally diverse.
-        Respond ONLY with a JSON list of selected agent IDs:
-        ["id1", "id2", ...]
+        Synthesize exactly {cfg.min_selected} distinct, non-overlapping directions from these proposals.
+        Each direction should represent a unique approach that can be executed independently.
+        The directions will be executed in parallel and then merged into a single result.
+
+        Respond ONLY with a JSON list of directions:
+        [
+          {{"plan": "high-level plan for direction 1", "key_details": "critical implementation details"}},
+          {{"plan": "high-level plan for direction 2", "key_details": "critical implementation details"}},
+          ...
+        ]
     """)
 
     if not pool.acquire():
         return proposals[: cfg.min_selected]
     try:
         raw = call_agent(cfg, prompt, depth=depth)
-        ids = extract_json(raw, expect_list=True)
-        if ids is None:
+        directions = extract_json(raw, expect_list=True)
+        if directions is None or not isinstance(directions, list):
             return proposals[: cfg.min_selected]
 
-        id_set = set(ids)
-        selected = [p for p in proposals if p.agent_id in id_set]
-        if len(selected) < cfg.min_selected:
-            selected = proposals[: cfg.min_selected]
-        return selected
+        synthesized = []
+        for i, d in enumerate(directions[: cfg.min_selected]):
+            if isinstance(d, dict):
+                synthesized.append(
+                    Proposal(
+                        agent_id=f"d{depth}-s{i}-{uuid.uuid4().hex[:6]}",
+                        plan=d.get("plan", ""),
+                        key_details=d.get("key_details", ""),
+                        backend=cfg.pick_backend(depth),
+                    )
+                )
+        if len(synthesized) < cfg.min_selected:
+            synthesized.extend(proposals[: cfg.min_selected - len(synthesized)])
+        return synthesized
     finally:
         pool.release()
 
@@ -515,7 +531,7 @@ def execute_proposal(
         )
 
 
-def evaluate_results(
+def merge_results(
     cfg: Config,
     pool: AgentPool,
     task: str,
@@ -523,7 +539,7 @@ def evaluate_results(
     depth: int,
     call_tree: CallTree,
 ) -> ExecutionResult | None:
-    """Phase 4: upper agent picks the best result."""
+    """Phase 4: merge all successful results into one."""
     successes = [r for r in results if r.success]
     if not successes:
         return None
@@ -536,22 +552,33 @@ def evaluate_results(
     )
     tree_context = call_tree.get_context_prompt()
     prompt = dedent(f"""\
-        You are an evaluator agent. Pick the best result for this task.
+        You are a merge agent. Combine ALL successful results into a single coherent solution.
         Task: {task}
         {f"\n\n=== CALL TREE (Parent Context) ===\n{tree_context}\n=== END CALL TREE ===\n" if tree_context else ""}
-        Results:
+        Results to merge:
         {summary}
 
-        Respond ONLY with the ID of the best result (just the string, no quotes or extra text).
+        Create a merged solution that combines the best parts of all results.
+        The merged result should be more complete than any individual result.
+
+        Respond ONLY with the merged solution (plain text, no JSON).
     """)
     if not pool.acquire():
         return successes[0]
     try:
-        raw = call_agent(cfg, prompt, depth=depth).strip().strip('"').strip("'")
-        for r in successes:
-            if r.agent_id in raw:
-                return r
-        return successes[0]
+        merged_output = call_agent(cfg, prompt, depth=depth)
+        return ExecutionResult(
+            agent_id=f"d{depth}-merge-{uuid.uuid4().hex[:6]}",
+            proposal=Proposal(
+                agent_id="merge",
+                plan="Merged solution from multiple directions",
+                key_details="",
+            ),
+            worktree=successes[0].worktree,
+            output=merged_output,
+            success=True,
+            call_tree=call_tree,
+        )
     finally:
         pool.release()
 
@@ -620,39 +647,45 @@ def run_layer(
                     finally:
                         pool.release()
 
-    # Phase 2: select
-    selected = select_proposals(cfg, pool, full_task, proposals, depth, call_tree)
-    print(f"{indent}[Layer {depth}] Selected {len(selected)} proposals for execution")
+    # Phase 2: synthesize
+    directions = synthesize_directions(
+        cfg, pool, full_task, proposals, depth, call_tree
+    )
+    print(
+        f"{indent}[Layer {depth}] Synthesized {len(directions)} directions for execution"
+    )
 
     # Phase 3: execute in parallel worktrees
     results: list[ExecutionResult] = []
-    with ThreadPoolExecutor(max_workers=len(selected)) as executor:
+    with ThreadPoolExecutor(max_workers=len(directions)) as executor:
         futures = {
             executor.submit(
                 execute_proposal, cfg, pool, full_task, p, depth, call_tree
             ): p
-            for p in selected
+            for p in directions
         }
         for f in as_completed(futures):
             results.append(f.result())
 
-    # Phase 4: evaluate
-    best = evaluate_results(cfg, pool, full_task, results, depth, call_tree)
-    if best is None:
+    # Phase 4: merge
+    merged = merge_results(cfg, pool, full_task, results, depth, call_tree)
+    if merged is None:
         print(f"{indent}[Layer {depth}] All executions failed")
         for r in results:
             remove_worktree(r.worktree)
         return "all executions failed"
 
-    print(f"{indent}[Layer {depth}] Winner: {best.agent_id}")
+    print(
+        f"{indent}[Layer {depth}] Merged {len([r for r in results if r.success])} results"
+    )
 
-    # Merge winner, clean up losers
+    # Clean up all worktrees, keep merged result
     for r in results:
-        if r.agent_id != best.agent_id:
+        if r.worktree != merged.worktree:
             remove_worktree(r.worktree)
-    merge_worktree(best.worktree)
+    merge_worktree(merged.worktree)
 
-    return best.output
+    return merged.output
 
 
 # ---------------------------------------------------------------------------
@@ -721,7 +754,7 @@ def run(
     ),
     max_depth: int = typer.Option(3, help="Maximum recursion depth"),
     min_competitors: int = typer.Option(3, "-n", help="Minimum competing proposals"),
-    min_selected: int = typer.Option(2, "-m", help="Minimum parallel executions"),
+    min_selected: int = typer.Option(2, "-m", help="Minimum synthesized directions"),
     max_agents: int = typer.Option(16, help="Global max concurrent agents"),
 ):
     """Run the LaYER agent system on a task."""
