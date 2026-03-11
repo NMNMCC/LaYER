@@ -498,23 +498,69 @@ def execute_proposal(
         if depth + 1 < cfg.max_depth:
             # Recurse — support explicit subtasks dispatched to the next layer
             if proposal.subtasks:
-                outputs = []
-                for j, sub in enumerate(proposal.subtasks):
-                    child_tree = call_tree.spawn_child(task=sub, depth=depth + 1)
-                    child_tree.mark_complete(
-                        agent_id=f"{tag}-sub{j}", plan=sub, backend=str(proposal.backend)
+                results: list[ExecutionResult] = []
+                futures = {}
+                max_workers = min(len(proposal.subtasks), cfg.max_agents)
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    for j, sub in enumerate(proposal.subtasks):
+                        subtag = f"{tag}-sub{j}"
+                        wt_sub = create_worktree(subtag)
+                        child_tree = call_tree.spawn_child(task=sub, depth=depth + 1)
+                        child_tree.mark_complete(
+                            agent_id=subtag, plan=sub, backend=str(proposal.backend)
+                        )
+
+                        def _run_sub(sub=sub, subtag=subtag, wt_sub=wt_sub, child_tree=child_tree):
+                            try:
+                                out = run_layer(
+                                    cfg,
+                                    pool,
+                                    sub,
+                                    proposal.plan,
+                                    depth + 1,
+                                    cwd=str(wt_sub),
+                                    call_tree=child_tree,
+                                )
+                                return ExecutionResult(
+                                    subtag,
+                                    Proposal(agent_id=subtag, plan=sub, key_details="", backend=proposal.backend),
+                                    wt_sub,
+                                    out[:2000],
+                                    True,
+                                    call_tree=child_tree,
+                                )
+                            except Exception as e:
+                                return ExecutionResult(
+                                    subtag,
+                                    Proposal(agent_id=subtag, plan=sub, key_details="", backend=proposal.backend),
+                                    wt_sub,
+                                    str(e)[:500],
+                                    False,
+                                    call_tree=child_tree,
+                                )
+
+                        futures[executor.submit(_run_sub)] = subtag
+                    for f in as_completed(futures):
+                        results.append(f.result())
+
+                # Merge subtask results (merge agent will synthesize a combined output)
+                merged = merge_results(cfg, pool, task, results, depth + 1, call_tree)
+
+                # Clean up non-merged worktrees
+                for r in results:
+                    try:
+                        if merged is None or r.worktree != merged.worktree:
+                            remove_worktree(r.worktree)
+                    except Exception:
+                        pass
+
+                if merged is None:
+                    call_tree.mark_complete(success=False)
+                    return ExecutionResult(
+                        tag, proposal, wt, "all subtask executions failed"[:2000], False, call_tree=call_tree
                     )
-                    out = run_layer(
-                        cfg,
-                        pool,
-                        sub,
-                        proposal.plan,
-                        depth + 1,
-                        cwd=str(wt),
-                        call_tree=child_tree,
-                    )
-                    outputs.append(out)
-                output = "\n\n--- SUBTASK OUTPUT ---\n\n".join(outputs)
+
+                output = merged.output
             else:
                 child_tree = call_tree.spawn_child(task=task, depth=depth + 1)
                 child_tree.mark_complete(
