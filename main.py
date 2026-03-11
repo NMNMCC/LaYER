@@ -229,6 +229,7 @@ class Proposal:
     plan: str
     key_details: str
     backend: AgentBackend | None = None
+    subtasks: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -373,21 +374,29 @@ def gather_proposals(
 
             tree_context = call_tree.get_context_prompt()
             prompt = dedent(f"""\
-                You are a competing agent bidding on a task. You MUST respond with valid JSON only.
+                You are a competing agent. Stay strictly on-task. Output valid JSON only.
                 Task: {task}
                 {f"\n\n=== CALL TREE (Parent Context) ===\n{tree_context}\n=== END CALL TREE ===\n" if tree_context else ""}
-                Previous proposals from other agents:
+                Previous proposals:
                 {prior}
 
-                Provide a NEW proposal that is meaningfully different from all previous ones.
-                If you cannot think of a substantially different approach, set "is_novel" to false.
+                Return JSON with these keys:
+                  - is_novel: true/false
+                  - plan: short high-level plan (<=200 chars)
+                  - key_details: short critical details (<=400 chars)
+                  - (optional) subtasks: ["subtask1", "subtask2"]
 
-                Respond ONLY with JSON:
-                {{"is_novel": true/false, "plan": "your high-level plan", "key_details": "critical implementation details"}}
+                If no novel approach, set is_novel to false.
             """)
             be = cfg.pick_backend(depth)
             raw = call_agent(cfg, prompt, depth=depth, backend=be)
             data = extract_json(raw)
+            # support optional subtasks field for explicit decomposition to next layer
+            subtasks = []
+            if isinstance(data, dict):
+                subtasks = data.get("subtasks", []) or []
+                if not isinstance(subtasks, list):
+                    subtasks = [str(subtasks)]
             if data is None:
                 print(f"  [depth={depth}] Agent {i} returned invalid JSON, skipping")
                 continue
@@ -404,6 +413,7 @@ def gather_proposals(
                     plan=data.get("plan", ""),
                     key_details=data.get("key_details", ""),
                     backend=be,
+                    subtasks=subtasks,
                 )
             )
             print(
@@ -432,22 +442,15 @@ def synthesize_directions(
     )
     tree_context = call_tree.get_context_prompt()
     prompt = dedent(f"""\
-        You are a manager agent synthesizing distinct execution directions.
+        You are a manager agent. Produce exactly {cfg.min_selected} distinct, executable directions. Keep them focused and non-overlapping.
         Task: {task}
         {f"\n\n=== CALL TREE (Parent Context) ===\n{tree_context}\n=== END CALL TREE ===\n" if tree_context else ""}
-        Proposals collected:
+        Proposals:
         {summary}
 
-        Synthesize exactly {cfg.min_selected} distinct, non-overlapping directions from these proposals.
-        Each direction should represent a unique approach that can be executed independently.
-        The directions will be executed in parallel and then merged into a single result.
-
-        Respond ONLY with a JSON list of directions:
-        [
-          {{"plan": "high-level plan for direction 1", "key_details": "critical implementation details"}},
-          {{"plan": "high-level plan for direction 2", "key_details": "critical implementation details"}},
-          ...
-        ]
+        Return a JSON list with exactly {cfg.min_selected} items. Each item must be:
+          {{"plan": "short plan (<=200 chars)", "key_details": "short details (<=400 chars)", "subtasks": [optional list of short subtasks]}}
+        Do NOT include extra text.
     """)
 
     if not pool.acquire():
@@ -467,6 +470,7 @@ def synthesize_directions(
                         plan=d.get("plan", ""),
                         key_details=d.get("key_details", ""),
                         backend=cfg.pick_backend(depth),
+                        subtasks=d.get("subtasks", []) if isinstance(d, dict) else [],
                     )
                 )
         if len(synthesized) < cfg.min_selected:
@@ -492,28 +496,50 @@ def execute_proposal(
     )
     try:
         if depth + 1 < cfg.max_depth:
-            # Recurse
-            child_tree = call_tree.spawn_child(task=task, depth=depth + 1)
-            child_tree.mark_complete(
-                agent_id=tag, plan=proposal.plan, backend=str(proposal.backend)
-            )
-            output = run_layer(
-                cfg,
-                pool,
-                task,
-                proposal.plan,
-                depth + 1,
-                cwd=str(wt),
-                call_tree=child_tree,
-            )
+            # Recurse — support explicit subtasks dispatched to the next layer
+            if proposal.subtasks:
+                outputs = []
+                for j, sub in enumerate(proposal.subtasks):
+                    child_tree = call_tree.spawn_child(task=sub, depth=depth + 1)
+                    child_tree.mark_complete(
+                        agent_id=f"{tag}-sub{j}", plan=sub, backend=str(proposal.backend)
+                    )
+                    out = run_layer(
+                        cfg,
+                        pool,
+                        sub,
+                        proposal.plan,
+                        depth + 1,
+                        cwd=str(wt),
+                        call_tree=child_tree,
+                    )
+                    outputs.append(out)
+                output = "\n\n--- SUBTASK OUTPUT ---\n\n".join(outputs)
+            else:
+                child_tree = call_tree.spawn_child(task=task, depth=depth + 1)
+                child_tree.mark_complete(
+                    agent_id=tag, plan=proposal.plan, backend=str(proposal.backend)
+                )
+                output = run_layer(
+                    cfg,
+                    pool,
+                    task,
+                    proposal.plan,
+                    depth + 1,
+                    cwd=str(wt),
+                    call_tree=child_tree,
+                )
         else:
             # Leaf — actually do the work
             prompt = dedent(f"""\
-                You are an implementation agent. Execute this task directly.
+                You are an implementation agent. Implement the Plan only. Do NOT add extra features.
                 Task: {task}
-                Plan to follow: {proposal.plan}
+                Plan: {proposal.plan}
                 Key details: {proposal.key_details}
-                Implement the solution now. Write/modify files as needed.
+
+                If the Plan lists subtasks, implement them as separate, minimal changes.
+
+                OUTPUT: Provide either a plain-text patch or a single-line JSON summary: {"result":"<summary>", "files_modified":[...]}.
             """)
             if not pool.acquire():
                 return ExecutionResult(tag, proposal, wt, "pool exhausted", False)
@@ -552,16 +578,12 @@ def merge_results(
     )
     tree_context = call_tree.get_context_prompt()
     prompt = dedent(f"""\
-        You are a merge agent. Combine ALL successful results into a single coherent solution.
+        You are a merge agent. Merge the successful results into one focused solution. Do NOT add new features.
         Task: {task}
-        {f"\n\n=== CALL TREE (Parent Context) ===\n{tree_context}\n=== END CALL TREE ===\n" if tree_context else ""}
-        Results to merge:
+        Results:
         {summary}
 
-        Create a merged solution that combines the best parts of all results.
-        The merged result should be more complete than any individual result.
-
-        Respond ONLY with the merged solution (plain text, no JSON).
+        Output the merged solution as plain text only.
     """)
     if not pool.acquire():
         return successes[0]
@@ -622,6 +644,7 @@ def run_layer(
     if len(proposals) >= cfg.min_competitors:
         convergence_prompt = dedent(f"""\
             Are these proposals essentially identical in approach? Answer ONLY "yes" or "no".
+            Read the plans below and answer strictly with 'yes' or 'no'. Do NOT provide explanation.
             {chr(10).join(p.plan for p in proposals)}
         """)
         if pool.acquire():
