@@ -1,17 +1,21 @@
+import asyncio
 import itertools
 import json
+import os
 import shlex
+import shutil
 import subprocess
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-import os
-import shutil
 from textwrap import dedent
 
 import typer
+from rich.console import Console
+from rich.live import Live
+from rich.tree import Tree
 
 app = typer.Typer(help="LaYER — LaYERed Agent Yielding Evaluated Results")
 
@@ -19,10 +23,6 @@ app = typer.Typer(help="LaYER — LaYERed Agent Yielding Evaluated Results")
 SUMMARY_MAX_LEN = 80
 
 # --- Rich-based status tree UI ------------------------------------------------
-from collections import defaultdict
-from rich.console import Console
-from rich.tree import Tree
-from rich.live import Live
 
 
 class StatusTree:
@@ -41,6 +41,8 @@ class StatusTree:
 
     def start(self) -> None:
         with self.lock:
+            self.messages.clear()
+            self.header = "LaYER"
             if self._live is None:
                 self._live = Live(self._render(), console=self.console, refresh_per_second=4)
                 self._live.__enter__()
@@ -126,6 +128,7 @@ class LayerPool:
         self._cycle = itertools.cycle(self.backends)
 
     def pick(self) -> AgentBackend:
+        # Single-threaded asyncio — no lock needed
         return next(self._cycle)
 
     def matches_depth(self, depth: int) -> bool:
@@ -169,36 +172,24 @@ class Config:
 
 class AgentPool:
     def __init__(self, limit: int):
-        self._sem = threading.Semaphore(limit)
+        self._sem = asyncio.Semaphore(limit)
         self._count = 0
-        self._lock = threading.Lock()
 
-    def acquire(self) -> bool:
-        got = self._sem.acquire(timeout=0)
-        if got:
-            with self._lock:
-                self._count += 1
-        return got
+    async def acquire(self) -> bool:
+        """Non-blocking try-acquire. Returns False immediately if pool is full."""
+        if self._sem.locked():
+            return False
+        await self._sem.acquire()
+        self._count += 1
+        return True
 
-    def release(self):
+    def release(self) -> None:
         self._sem.release()
-        with self._lock:
-            self._count -= 1
+        self._count -= 1
 
     @property
     def active(self) -> int:
-        with self._lock:
-            return self._count
-
-
-_pool: AgentPool | None = None
-
-
-def get_pool(cfg: Config) -> AgentPool:
-    global _pool
-    if _pool is None:
-        _pool = AgentPool(cfg.max_agents)
-    return _pool
+        return self._count
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +216,7 @@ def extract_json(raw: str, expect_list: bool = False):
 # ---------------------------------------------------------------------------
 
 
-def call_agent(
+async def call_agent(
     cfg: Config,
     prompt: str,
     depth: int = 0,
@@ -240,28 +231,32 @@ def call_agent(
     cmd_list = be.render(prompt)
     ui.add(depth, f"Starting agent [{be}]...")
     try:
-        result = subprocess.run(
-            cmd_list,
-            capture_output=True,
-            text=True,
+        proc = await asyncio.create_subprocess_exec(
+            *cmd_list,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
-            timeout=600,
         )
     except FileNotFoundError as e:
         ui.add(depth, f"Agent command not found: {e}")
         raise
-    except subprocess.TimeoutExpired as e:
-        ui.add(depth, f"Agent [{be}] timed out after {e.timeout}s")
-        raise
 
-    if result.returncode != 0:
-        stderr_excerpt = (result.stderr or "")[:400]
-        ui.add(depth, f"Agent [{be}] failed (rc={result.returncode}): {stderr_excerpt}")
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        ui.add(depth, f"Agent [{be}] timed out after 600s")
+        raise subprocess.TimeoutExpired(cmd_list, 600)
+
+    if proc.returncode != 0:
+        stderr_excerpt = (stderr.decode() if stderr else "")[:400]
+        ui.add(depth, f"Agent [{be}] failed (rc={proc.returncode}): {stderr_excerpt}")
         raise RuntimeError(f"Agent [{be}] failed: {stderr_excerpt}")
 
-    stdout_excerpt = (result.stdout or "").strip()
-    ui.add(depth, f"Agent [{be}] finished, output len={len(stdout_excerpt)}")
-    return stdout_excerpt
+    stdout_text = (stdout.decode() if stdout else "").strip()
+    ui.add(depth, f"Agent [{be}] finished, output len={len(stdout_text)}")
+    return stdout_text
 
 
 # ---------------------------------------------------------------------------
@@ -269,64 +264,60 @@ def call_agent(
 # ---------------------------------------------------------------------------
 
 
-def repo_root() -> Path:
-    out = subprocess.check_output(
-        ["git", "rev-parse", "--show-toplevel"], text=True
-    ).strip()
-    return Path(out)
-
-
-def create_worktree(tag: str) -> Path:
-    root = repo_root()
-    branch = f"layer-{tag}"
-    wt_dir = root.parent / f".layer-worktrees" / branch
-    wt_dir.parent.mkdir(parents=True, exist_ok=True)
-    current = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    subprocess.run(["git", "branch", branch, current], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "worktree", "add", str(wt_dir), branch], check=True, capture_output=True
+async def _git(*args: str, check: bool = False) -> tuple[int, bytes, bytes]:
+    """Run a git command asynchronously and return (returncode, stdout, stderr)."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+    stdout, stderr = await proc.communicate()
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed (rc={proc.returncode}): {stderr.decode()[:200]}")
+    return proc.returncode, stdout, stderr
+
+
+async def repo_root() -> Path:
+    _, stdout, _ = await _git("rev-parse", "--show-toplevel", check=True)
+    return Path(stdout.decode().strip())
+
+
+async def create_worktree(tag: str) -> Path:
+    root = await repo_root()
+    branch = f"layer-{tag}"
+    wt_dir = root.parent / ".layer-worktrees" / branch
+    wt_dir.parent.mkdir(parents=True, exist_ok=True)
+    _, stdout, _ = await _git("rev-parse", "HEAD", check=True)
+    current = stdout.decode().strip()
+    await _git("branch", branch, current, check=True)
+    await _git("worktree", "add", str(wt_dir), branch, check=True)
     return wt_dir
 
 
-def remove_worktree(wt_dir: Path):
+async def remove_worktree(wt_dir: Path) -> None:
     """Remove a git worktree and delete its branch, then fully delete the directory.
 
     Safety: only remove directories under the repo's .layer-worktrees directory.
     """
     try:
-        root = repo_root()
+        root = await repo_root()
         base = root.parent / ".layer-worktrees"
-        # Ensure target is under base to avoid accidental deletion
         try:
             wt_real = wt_dir.resolve()
             base_real = base.resolve()
             if not str(wt_real).startswith(str(base_real)):
                 # Not under managed worktrees dir — do not recursively delete; still attempt git cleanup
-                subprocess.run(
-                    ["git", "worktree", "remove", "--force", str(wt_dir)], capture_output=True
-                )
-                subprocess.run(["git", "branch", "-D", wt_dir.name], capture_output=True)
+                await _git("worktree", "remove", "--force", str(wt_dir))
+                await _git("branch", "-D", wt_dir.name)
                 return
         except Exception:
-            # If resolve fails, be conservative and avoid recursive deletion
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", str(wt_dir)], capture_output=True
-            )
-            subprocess.run(["git", "branch", "-D", wt_dir.name], capture_output=True)
+            await _git("worktree", "remove", "--force", str(wt_dir))
+            await _git("branch", "-D", wt_dir.name)
             return
 
-        # Attempt normal git cleanup
-        subprocess.run([
-            "git",
-            "worktree",
-            "remove",
-            "--force",
-            str(wt_dir),
-        ], capture_output=True)
-        subprocess.run(["git", "branch", "-D", wt_dir.name], capture_output=True)
+        await _git("worktree", "remove", "--force", str(wt_dir))
+        await _git("branch", "-D", wt_dir.name)
     finally:
-        # Ensure directory is removed from filesystem
         try:
             if wt_dir.exists():
                 shutil.rmtree(wt_dir, ignore_errors=True)
@@ -334,12 +325,10 @@ def remove_worktree(wt_dir: Path):
             pass
 
 
-def merge_worktree(wt_dir: Path):
+async def merge_worktree(wt_dir: Path) -> None:
     branch = wt_dir.name
-    subprocess.run(
-        ["git", "merge", branch, "--no-edit"], check=True, capture_output=True
-    )
-    remove_worktree(wt_dir)
+    await _git("merge", branch, "--no-edit", check=True)
+    await remove_worktree(wt_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +399,7 @@ class CallTree:
     """The full call tree with a reference to the current node."""
 
     root: CallNode = field(default_factory=lambda: CallNode(task="<root>", depth=-1))
-    current: CallNode = field(default=None)  # type: ignore
+    current: CallNode | None = field(default=None)
 
     def __post_init__(self):
         if self.current is None:
@@ -477,13 +466,13 @@ class ExecutionResult:
     call_tree: CallTree | None = None
 
 
-def gather_proposals(
+async def gather_proposals(
     cfg: Config, pool: AgentPool, task: str, depth: int, call_tree: CallTree
 ) -> list[Proposal]:
     """Phase 1: sequentially collect competing proposals until convergence."""
     proposals: list[Proposal] = []
     for i in range(cfg.min_competitors * 3):  # hard upper bound
-        if not pool.acquire():
+        if not await pool.acquire():
             ui.add(depth, f"Agent pool exhausted, stopping proposals at {len(proposals)}")
             break
         try:
@@ -511,17 +500,16 @@ def gather_proposals(
                 If no novel approach, set is_novel to false.
             """)
             be = cfg.pick_backend(depth)
-            raw = call_agent(cfg, prompt, depth=depth, backend=be)
+            raw = await call_agent(cfg, prompt, depth=depth, backend=be)
             data = extract_json(raw)
-            # support optional subtasks field for explicit decomposition to next layer
-            subtasks = []
-            if isinstance(data, dict):
-                subtasks = data.get("subtasks", []) or []
-                if not isinstance(subtasks, list):
-                    subtasks = [str(subtasks)]
             if data is None:
                 ui.add(depth, f"Agent {i} returned invalid JSON, skipping")
                 continue
+
+            # support optional subtasks field for explicit decomposition to next layer
+            subtasks = data.get("subtasks", []) or []
+            if not isinstance(subtasks, list):
+                subtasks = [str(subtasks)]
 
             if not data.get("is_novel", True) and len(proposals) >= cfg.min_competitors:
                 ui.add(depth, f"Proposals converged after {len(proposals)} agents")
@@ -547,7 +535,7 @@ def gather_proposals(
     return proposals
 
 
-def synthesize_directions(
+async def synthesize_directions(
     cfg: Config,
     pool: AgentPool,
     task: str,
@@ -575,10 +563,10 @@ def synthesize_directions(
         Do NOT include extra text.
     """)
 
-    if not pool.acquire():
+    if not await pool.acquire():
         return proposals[: cfg.min_selected]
     try:
-        raw = call_agent(cfg, prompt, depth=depth)
+        raw = await call_agent(cfg, prompt, depth=depth)
         directions = extract_json(raw, expect_list=True)
         if directions is None or not isinstance(directions, list):
             return proposals[: cfg.min_selected]
@@ -602,7 +590,7 @@ def synthesize_directions(
         pool.release()
 
 
-def execute_proposal(
+async def execute_proposal(
     cfg: Config,
     pool: AgentPool,
     task: str,
@@ -612,65 +600,50 @@ def execute_proposal(
 ) -> ExecutionResult:
     """Phase 3: execute a single proposal in its own worktree."""
     tag = proposal.agent_id
-    wt = create_worktree(tag)
+    wt = await create_worktree(tag)
     ui.add(depth, f"Executing {proposal.agent_id} [{proposal.backend}] in {wt}")
     try:
         if depth + 1 < cfg.max_depth:
             # Recurse — support explicit subtasks dispatched to the next layer
             if proposal.subtasks:
-                results: list[ExecutionResult] = []
-                futures = {}
-                max_workers = min(len(proposal.subtasks), cfg.max_agents)
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    for j, sub in enumerate(proposal.subtasks):
-                        subtag = f"{tag}-sub{j}"
-                        wt_sub = create_worktree(subtag)
-                        child_tree = call_tree.spawn_child(task=sub, depth=depth + 1)
-                        child_tree.mark_complete(
-                            agent_id=subtag, plan=sub, backend=str(proposal.backend)
+                async def _run_sub(sub: str, subtag: str, wt_sub: Path, child_tree: CallTree) -> ExecutionResult:
+                    try:
+                        out = await run_layer(
+                            cfg, pool, sub, proposal.plan, depth + 1,
+                            cwd=str(wt_sub), call_tree=child_tree,
+                        )
+                        return ExecutionResult(
+                            subtag,
+                            Proposal(agent_id=subtag, plan=sub, key_details="", backend=proposal.backend),
+                            wt_sub, out[:2000], True, call_tree=child_tree,
+                        )
+                    except Exception as e:
+                        return ExecutionResult(
+                            subtag,
+                            Proposal(agent_id=subtag, plan=sub, key_details="", backend=proposal.backend),
+                            wt_sub, str(e)[:500], False, call_tree=child_tree,
                         )
 
-                        def _run_sub(sub=sub, subtag=subtag, wt_sub=wt_sub, child_tree=child_tree):
-                            try:
-                                out = run_layer(
-                                    cfg,
-                                    pool,
-                                    sub,
-                                    proposal.plan,
-                                    depth + 1,
-                                    cwd=str(wt_sub),
-                                    call_tree=child_tree,
-                                )
-                                return ExecutionResult(
-                                    subtag,
-                                    Proposal(agent_id=subtag, plan=sub, key_details="", backend=proposal.backend),
-                                    wt_sub,
-                                    out[:2000],
-                                    True,
-                                    call_tree=child_tree,
-                                )
-                            except Exception as e:
-                                return ExecutionResult(
-                                    subtag,
-                                    Proposal(agent_id=subtag, plan=sub, key_details="", backend=proposal.backend),
-                                    wt_sub,
-                                    str(e)[:500],
-                                    False,
-                                    call_tree=child_tree,
-                                )
+                sub_args = []
+                for j, sub in enumerate(proposal.subtasks):
+                    subtag = f"{tag}-sub{j}"
+                    wt_sub = await create_worktree(subtag)
+                    child_tree = call_tree.spawn_child(task=sub, depth=depth + 1)
+                    child_tree.mark_complete(agent_id=subtag, plan=sub, backend=str(proposal.backend))
+                    sub_args.append((sub, subtag, wt_sub, child_tree))
 
-                        futures[executor.submit(_run_sub)] = subtag
-                    for f in as_completed(futures):
-                        results.append(f.result())
+                results: list[ExecutionResult] = list(
+                    await asyncio.gather(*[_run_sub(*args) for args in sub_args])
+                )
 
                 # Merge subtask results (merge agent will synthesize a combined output)
-                merged = merge_results(cfg, pool, task, results, depth + 1, call_tree)
+                merged = await merge_results(cfg, pool, task, results, depth + 1, call_tree)
 
                 # Clean up non-merged worktrees
                 for r in results:
                     try:
                         if merged is None or r.worktree != merged.worktree:
-                            remove_worktree(r.worktree)
+                            await remove_worktree(r.worktree)
                     except Exception:
                         pass
 
@@ -686,31 +659,25 @@ def execute_proposal(
                 child_tree.mark_complete(
                     agent_id=tag, plan=proposal.plan, backend=str(proposal.backend)
                 )
-                output = run_layer(
-                    cfg,
-                    pool,
-                    task,
-                    proposal.plan,
-                    depth + 1,
-                    cwd=str(wt),
-                    call_tree=child_tree,
+                output = await run_layer(
+                    cfg, pool, task, proposal.plan, depth + 1,
+                    cwd=str(wt), call_tree=child_tree,
                 )
         else:
             # Leaf — actually do the work
             prompt = dedent(f"""\
-                You are an implementation agent. Implement the Plan only. Do NOT add extra features.
+                You are an implementation agent working in your own git worktree.
+                Implement the Plan directly by modifying files in the current directory. Do NOT add extra features.
                 Task: {task}
                 Plan: {proposal.plan}
                 Key details: {proposal.key_details}
 
                 If the Plan lists subtasks, implement them as separate, minimal changes.
-
-                OUTPUT: Provide either a plain-text patch or a single-line JSON summary: {"result":"<summary>", "files_modified":[...]}.
             """)
-            if not pool.acquire():
+            if not await pool.acquire():
                 return ExecutionResult(tag, proposal, wt, "pool exhausted", False)
             try:
-                output = call_agent(cfg, prompt, cwd=str(wt), backend=proposal.backend)
+                output = await call_agent(cfg, prompt, cwd=str(wt), backend=proposal.backend)
             finally:
                 pool.release()
         return ExecutionResult(
@@ -723,7 +690,7 @@ def execute_proposal(
         )
 
 
-def merge_results(
+async def merge_results(
     cfg: Config,
     pool: AgentPool,
     task: str,
@@ -746,34 +713,31 @@ def merge_results(
     prompt = dedent(f"""\
         You are a merge agent. Merge the successful results into one focused solution. Do NOT add new features.
         Task: {task}
+        {f"\n\n=== CALL TREE (Parent Context) ===\n{tree_context}\n=== END CALL TREE ===\n" if tree_context else ""}
         Results:
         {summary}
 
         Output the merged solution as plain text only.
     """)
-    if not pool.acquire():
+    if not await pool.acquire():
         return successes[0]
     try:
         # Create a dedicated merge worktree for the merge agent
         merge_tag = f"d{depth}-merge-{uuid.uuid4().hex[:6]}"
-        merge_wt = create_worktree(merge_tag)
+        merge_wt = await create_worktree(merge_tag)
         worktrees_dir = merge_wt / ".worktrees"
         worktrees_dir.mkdir(parents=True, exist_ok=True)
 
         # Link each successful worktree into the merge worktree under .worktrees/<id>
         # Use symlinks to avoid copying heavy directories (node_modules etc.) and preserve filesystem semantics.
-        created_symlinks: list[Path] = []
         for r in successes:
             dest = worktrees_dir / r.agent_id
             try:
-                # Create a relative symlink when possible
                 try:
                     rel_target = os.path.relpath(r.worktree, start=worktrees_dir)
                     dest.symlink_to(rel_target)
                 except Exception:
-                    # fallback to absolute symlink
                     dest.symlink_to(r.worktree)
-                created_symlinks.append(dest)
             except Exception:
                 # If symlink fails, fall back to best-effort copy of files (excluding .git)
                 try:
@@ -797,17 +761,14 @@ def merge_results(
                         pass
 
         # Run merge agent in the merge worktree so it can inspect .worktrees/
-        merged_output = call_agent(cfg, prompt, depth=depth, cwd=str(merge_wt))
+        merged_output = await call_agent(cfg, prompt, depth=depth, cwd=str(merge_wt))
 
-        # After merge, attempt to unregister/remove original worktrees and clean up symlinks/copies
-        for r in successes:
-            try:
-                remove_worktree(r.worktree)
-            except Exception:
-                # ignore failures; best-effort cleanup
-                pass
+        # After merge, clean up original worktrees and symlinks/copies
+        await asyncio.gather(
+            *[remove_worktree(r.worktree) for r in successes],
+            return_exceptions=True,
+        )
 
-        # Remove symlinks or copied directories under .worktrees
         for entry in worktrees_dir.iterdir():
             try:
                 if entry.is_symlink():
@@ -815,14 +776,9 @@ def merge_results(
                 elif entry.is_dir():
                     shutil.rmtree(entry)
                 else:
-                    try:
-                        entry.unlink()
-                    except Exception:
-                        pass
+                    entry.unlink()
             except Exception:
                 pass
-
-        # Finally, remove the .worktrees directory itself
         try:
             worktrees_dir.rmdir()
         except Exception:
@@ -844,7 +800,7 @@ def merge_results(
         pool.release()
 
 
-def run_layer(
+async def run_layer(
     cfg: Config,
     pool: AgentPool,
     task: str,
@@ -867,13 +823,13 @@ def run_layer(
     )
 
     # Phase 1: gather proposals
-    proposals = gather_proposals(cfg, pool, full_task, depth, call_tree)
+    proposals = await gather_proposals(cfg, pool, full_task, depth, call_tree)
     if not proposals:
         ui.add(depth, "No proposals generated, executing directly")
-        if not pool.acquire():
+        if not await pool.acquire():
             return "pool exhausted"
         try:
-            return call_agent(
+            return await call_agent(
                 cfg, f"Execute this task directly:\n{full_task}", depth=depth, cwd=cwd
             )
         finally:
@@ -886,11 +842,9 @@ def run_layer(
             Read the plans below and answer strictly with 'yes' or 'no'. Do NOT provide explanation.
             {chr(10).join(p.plan for p in proposals)}
         """)
-        if pool.acquire():
+        if await pool.acquire():
             try:
-                answer = (
-                    call_agent(cfg, convergence_prompt, depth=depth).strip().lower()
-                )
+                answer = (await call_agent(cfg, convergence_prompt, depth=depth)).strip().lower()
             finally:
                 pool.release()
             if "yes" in answer:
@@ -901,45 +855,38 @@ def run_layer(
                     Plan: {proposals[0].plan}
                     Details: {proposals[0].key_details}
                 """)
-                if pool.acquire():
+                if await pool.acquire():
                     try:
-                        return call_agent(cfg, prompt, depth=depth, cwd=cwd)
+                        return await call_agent(cfg, prompt, depth=depth, cwd=cwd)
                     finally:
                         pool.release()
 
     # Phase 2: synthesize
-    directions = synthesize_directions(
-        cfg, pool, full_task, proposals, depth, call_tree
-    )
+    directions = await synthesize_directions(cfg, pool, full_task, proposals, depth, call_tree)
     ui.add(depth, f"Synthesized {len(directions)} directions for execution")
 
-    # Phase 3: execute in parallel worktrees
-    results: list[ExecutionResult] = []
-    with ThreadPoolExecutor(max_workers=len(directions)) as executor:
-        futures = {
-            executor.submit(
-                execute_proposal, cfg, pool, full_task, p, depth, call_tree
-            ): p
-            for p in directions
-        }
-        for f in as_completed(futures):
-            results.append(f.result())
+    # Phase 3: execute all directions in parallel
+    results: list[ExecutionResult] = list(
+        await asyncio.gather(
+            *[execute_proposal(cfg, pool, full_task, p, depth, call_tree) for p in directions]
+        )
+    )
 
     # Phase 4: merge
-    merged = merge_results(cfg, pool, full_task, results, depth, call_tree)
+    merged = await merge_results(cfg, pool, full_task, results, depth, call_tree)
     if merged is None:
         ui.add(depth, "All executions failed")
-        for r in results:
-            remove_worktree(r.worktree)
+        await asyncio.gather(*[remove_worktree(r.worktree) for r in results], return_exceptions=True)
         return "all executions failed"
 
     ui.add(depth, f"Merged {len([r for r in results if r.success])} results")
 
     # Clean up all worktrees, keep merged result
-    for r in results:
-        if r.worktree != merged.worktree:
-            remove_worktree(r.worktree)
-    merge_worktree(merged.worktree)
+    await asyncio.gather(
+        *[remove_worktree(r.worktree) for r in results if r.worktree != merged.worktree],
+        return_exceptions=True,
+    )
+    await merge_worktree(merged.worktree)
 
     return merged.output
 
@@ -1032,7 +979,7 @@ def run(
         max_agents=max_agents,
         layer_pools=layer_pools,
     )
-    pool = get_pool(cfg)
+    pool = AgentPool(cfg.max_agents)
     ui.start()
     # header shows basic startup info; do not populate a meta section
     ui.set_header(
@@ -1040,11 +987,15 @@ def run(
     )
 
     try:
-        result = run_layer(cfg, pool, task)
+        result = asyncio.run(_run_async(cfg, pool, task))
         # show final result in header (concise)
         ui.set_header(ui.header + f" | Final result: {result[:SUMMARY_MAX_LEN]}{'...' if len(result) > SUMMARY_MAX_LEN else ''}")
     finally:
         ui.stop()
+
+
+async def _run_async(cfg: Config, pool: AgentPool, task: str) -> str:
+    return await run_layer(cfg, pool, task)
 
 
 if __name__ == "__main__":
