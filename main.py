@@ -15,6 +15,9 @@ import typer
 
 app = typer.Typer(help="LaYER — LaYERed Agent Yielding Evaluated Results")
 
+# maximum characters to show in brief summaries
+SUMMARY_MAX_LEN = 80
+
 # --- Rich-based status tree UI ------------------------------------------------
 from collections import defaultdict
 from rich.console import Console
@@ -513,7 +516,7 @@ def gather_proposals(
                     subtasks=subtasks,
                 )
             )
-            ui.add(depth, f"Proposal {len(proposals)} [{be}]: {proposals[-1].plan[:80]}...")
+            ui.add(depth, f"Proposal {len(proposals)} [{be}]: {proposals[-1].plan[:SUMMARY_MAX_LEN]}{'...' if len(proposals[-1].plan) > SUMMARY_MAX_LEN else ''}")
         finally:
             pool.release()
 
@@ -831,7 +834,7 @@ def run_layer(
         call_tree = CallTree()
 
     # show task in the status tree
-    ui.add(depth, f"Task: {task[:100]}...")
+    ui.add(depth, f"Task: {task[:SUMMARY_MAX_LEN]}{'...' if len(task) > SUMMARY_MAX_LEN else ''}")
 
     full_task = (
         f"{task}\n\nAdditional context from upper layer:\n{context}"
