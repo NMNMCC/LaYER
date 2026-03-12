@@ -17,6 +17,13 @@ from rich.console import Console
 from rich.live import Live
 from rich.tree import Tree
 
+from cache import (
+    CacheEntry,
+    compute_task_hash,
+    lookup_cache,
+    save_cache,
+)
+
 app = typer.Typer(help="LaYER — LaYERed Agent Yielding Evaluated Results")
 
 # maximum characters to show in brief summaries
@@ -44,7 +51,9 @@ class StatusTree:
             self.messages.clear()
             self.header = "LaYER"
             if self._live is None:
-                self._live = Live(self._render(), console=self.console, refresh_per_second=4)
+                self._live = Live(
+                    self._render(), console=self.console, refresh_per_second=4
+                )
                 self._live.__enter__()
 
     def stop(self) -> None:
@@ -267,13 +276,16 @@ async def call_agent(
 async def _git(*args: str, check: bool = False) -> tuple[int, bytes, bytes]:
     """Run a git command asynchronously and return (returncode, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
-        "git", *args,
+        "git",
+        *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate()
     if check and proc.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed (rc={proc.returncode}): {stderr.decode()[:200]}")
+        raise RuntimeError(
+            f"git {' '.join(args)} failed (rc={proc.returncode}): {stderr.decode()[:200]}"
+        )
     return proc.returncode, stdout, stderr
 
 
@@ -464,6 +476,30 @@ class ExecutionResult:
     output: str
     success: bool
     call_tree: CallTree | None = None
+    task_hash: str | None = None
+    test_passed: bool | None = None
+    test_output: str = ""
+
+
+async def run_tests(cwd: str) -> tuple[bool, str]:
+    """Run project tests in the given directory. Returns (passed, output)."""
+    test_commands = ["npm test", "pytest", "make test", "cargo test"]
+    for cmd in test_commands:
+        try:
+            parts = shlex.split(cmd)
+            proc = await asyncio.create_subprocess_exec(
+                *parts,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=cwd,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300.0)
+            output = stdout.decode() if stdout else ""
+            passed = proc.returncode == 0
+            return passed, output[:5000]
+        except (FileNotFoundError, asyncio.TimeoutError):
+            continue
+    return True, ""  # No test framework found, assume pass
 
 
 async def gather_proposals(
@@ -473,7 +509,9 @@ async def gather_proposals(
     proposals: list[Proposal] = []
     for i in range(cfg.min_competitors * 3):  # hard upper bound
         if not await pool.acquire():
-            ui.add(depth, f"Agent pool exhausted, stopping proposals at {len(proposals)}")
+            ui.add(
+                depth, f"Agent pool exhausted, stopping proposals at {len(proposals)}"
+            )
             break
         try:
             prior = (
@@ -600,28 +638,69 @@ async def execute_proposal(
 ) -> ExecutionResult:
     """Phase 3: execute a single proposal in its own worktree."""
     tag = proposal.agent_id
+    task_hash = compute_task_hash(task, proposal.plan, proposal.key_details)
+
+    cached = lookup_cache(task, proposal.plan, proposal.key_details)
+    if cached and cached.success:
+        ui.add(depth, f"Cache hit for {task_hash}, reusing result")
+        return ExecutionResult(
+            tag,
+            proposal,
+            Path(""),
+            cached.output,
+            True,
+            call_tree=call_tree,
+            task_hash=task_hash,
+            test_passed=cached.test_passed,
+            test_output=cached.test_output,
+        )
+
     wt = await create_worktree(tag)
     ui.add(depth, f"Executing {proposal.agent_id} [{proposal.backend}] in {wt}")
     try:
         if depth + 1 < cfg.max_depth:
             # Recurse — support explicit subtasks dispatched to the next layer
             if proposal.subtasks:
-                async def _run_sub(sub: str, subtag: str, wt_sub: Path, child_tree: CallTree) -> ExecutionResult:
+
+                async def _run_sub(
+                    sub: str, subtag: str, wt_sub: Path, child_tree: CallTree
+                ) -> ExecutionResult:
                     try:
                         out = await run_layer(
-                            cfg, pool, sub, proposal.plan, depth + 1,
-                            cwd=str(wt_sub), call_tree=child_tree,
+                            cfg,
+                            pool,
+                            sub,
+                            proposal.plan,
+                            depth + 1,
+                            cwd=str(wt_sub),
+                            call_tree=child_tree,
                         )
                         return ExecutionResult(
                             subtag,
-                            Proposal(agent_id=subtag, plan=sub, key_details="", backend=proposal.backend),
-                            wt_sub, out[:2000], True, call_tree=child_tree,
+                            Proposal(
+                                agent_id=subtag,
+                                plan=sub,
+                                key_details="",
+                                backend=proposal.backend,
+                            ),
+                            wt_sub,
+                            out[:2000],
+                            True,
+                            call_tree=child_tree,
                         )
                     except Exception as e:
                         return ExecutionResult(
                             subtag,
-                            Proposal(agent_id=subtag, plan=sub, key_details="", backend=proposal.backend),
-                            wt_sub, str(e)[:500], False, call_tree=child_tree,
+                            Proposal(
+                                agent_id=subtag,
+                                plan=sub,
+                                key_details="",
+                                backend=proposal.backend,
+                            ),
+                            wt_sub,
+                            str(e)[:500],
+                            False,
+                            call_tree=child_tree,
                         )
 
                 sub_args = []
@@ -629,7 +708,9 @@ async def execute_proposal(
                     subtag = f"{tag}-sub{j}"
                     wt_sub = await create_worktree(subtag)
                     child_tree = call_tree.spawn_child(task=sub, depth=depth + 1)
-                    child_tree.mark_complete(agent_id=subtag, plan=sub, backend=str(proposal.backend))
+                    child_tree.mark_complete(
+                        agent_id=subtag, plan=sub, backend=str(proposal.backend)
+                    )
                     sub_args.append((sub, subtag, wt_sub, child_tree))
 
                 results: list[ExecutionResult] = list(
@@ -637,7 +718,9 @@ async def execute_proposal(
                 )
 
                 # Merge subtask results (merge agent will synthesize a combined output)
-                merged = await merge_results(cfg, pool, task, results, depth + 1, call_tree)
+                merged = await merge_results(
+                    cfg, pool, task, results, depth + 1, call_tree
+                )
 
                 # Clean up non-merged worktrees
                 for r in results:
@@ -650,7 +733,12 @@ async def execute_proposal(
                 if merged is None:
                     call_tree.mark_complete(success=False)
                     return ExecutionResult(
-                        tag, proposal, wt, "all subtask executions failed"[:2000], False, call_tree=call_tree
+                        tag,
+                        proposal,
+                        wt,
+                        "all subtask executions failed"[:2000],
+                        False,
+                        call_tree=call_tree,
                     )
 
                 output = merged.output
@@ -660,8 +748,13 @@ async def execute_proposal(
                     agent_id=tag, plan=proposal.plan, backend=str(proposal.backend)
                 )
                 output = await run_layer(
-                    cfg, pool, task, proposal.plan, depth + 1,
-                    cwd=str(wt), call_tree=child_tree,
+                    cfg,
+                    pool,
+                    task,
+                    proposal.plan,
+                    depth + 1,
+                    cwd=str(wt),
+                    call_tree=child_tree,
                 )
         else:
             # Leaf — actually do the work
@@ -677,11 +770,36 @@ async def execute_proposal(
             if not await pool.acquire():
                 return ExecutionResult(tag, proposal, wt, "pool exhausted", False)
             try:
-                output = await call_agent(cfg, prompt, cwd=str(wt), backend=proposal.backend)
+                output = await call_agent(
+                    cfg, prompt, cwd=str(wt), backend=proposal.backend
+                )
             finally:
                 pool.release()
+
+        test_passed, test_output = await run_tests(str(wt))
+        ui.add(depth, f"Tests {'passed' if test_passed else 'failed'} for {tag}")
+
+        cache_entry = CacheEntry(
+            task_hash=task_hash,
+            task=task,
+            plan=proposal.plan,
+            output=output[:2000],
+            success=True,
+            test_passed=test_passed,
+            test_output=test_output,
+        )
+        save_cache(cache_entry)
+
         return ExecutionResult(
-            tag, proposal, wt, output[:2000], True, call_tree=call_tree
+            tag,
+            proposal,
+            wt,
+            output[:2000],
+            True,
+            call_tree=call_tree,
+            task_hash=task_hash,
+            test_passed=test_passed,
+            test_output=test_output,
         )
     except Exception as e:
         call_tree.mark_complete(success=False)
@@ -741,17 +859,19 @@ async def merge_results(
             except Exception:
                 # If symlink fails, fall back to best-effort copy of files (excluding .git)
                 try:
-                    shutil.copytree(r.worktree, dest, ignore=shutil.ignore_patterns('.git'))
+                    shutil.copytree(
+                        r.worktree, dest, ignore=shutil.ignore_patterns(".git")
+                    )
                 except Exception:
                     try:
                         dest.mkdir(parents=True, exist_ok=True)
-                        for src_path in r.worktree.rglob('*'):
+                        for src_path in r.worktree.rglob("*"):
                             rel = src_path.relative_to(r.worktree)
                             target = dest / rel
                             if src_path.is_dir():
                                 target.mkdir(parents=True, exist_ok=True)
                             else:
-                                if src_path.name == '.git':
+                                if src_path.name == ".git":
                                     continue
                                 try:
                                     shutil.copy2(src_path, target)
@@ -814,7 +934,10 @@ async def run_layer(
         call_tree = CallTree()
 
     # show task in the status tree
-    ui.add(depth, f"Task: {task[:SUMMARY_MAX_LEN]}{'...' if len(task) > SUMMARY_MAX_LEN else ''}")
+    ui.add(
+        depth,
+        f"Task: {task[:SUMMARY_MAX_LEN]}{'...' if len(task) > SUMMARY_MAX_LEN else ''}",
+    )
 
     full_task = (
         f"{task}\n\nAdditional context from upper layer:\n{context}"
@@ -844,7 +967,11 @@ async def run_layer(
         """)
         if await pool.acquire():
             try:
-                answer = (await call_agent(cfg, convergence_prompt, depth=depth)).strip().lower()
+                answer = (
+                    (await call_agent(cfg, convergence_prompt, depth=depth))
+                    .strip()
+                    .lower()
+                )
             finally:
                 pool.release()
             if "yes" in answer:
@@ -862,13 +989,18 @@ async def run_layer(
                         pool.release()
 
     # Phase 2: synthesize
-    directions = await synthesize_directions(cfg, pool, full_task, proposals, depth, call_tree)
+    directions = await synthesize_directions(
+        cfg, pool, full_task, proposals, depth, call_tree
+    )
     ui.add(depth, f"Synthesized {len(directions)} directions for execution")
 
     # Phase 3: execute all directions in parallel
     results: list[ExecutionResult] = list(
         await asyncio.gather(
-            *[execute_proposal(cfg, pool, full_task, p, depth, call_tree) for p in directions]
+            *[
+                execute_proposal(cfg, pool, full_task, p, depth, call_tree)
+                for p in directions
+            ]
         )
     )
 
@@ -876,14 +1008,20 @@ async def run_layer(
     merged = await merge_results(cfg, pool, full_task, results, depth, call_tree)
     if merged is None:
         ui.add(depth, "All executions failed")
-        await asyncio.gather(*[remove_worktree(r.worktree) for r in results], return_exceptions=True)
+        await asyncio.gather(
+            *[remove_worktree(r.worktree) for r in results], return_exceptions=True
+        )
         return "all executions failed"
 
     ui.add(depth, f"Merged {len([r for r in results if r.success])} results")
 
     # Clean up all worktrees, keep merged result
     await asyncio.gather(
-        *[remove_worktree(r.worktree) for r in results if r.worktree != merged.worktree],
+        *[
+            remove_worktree(r.worktree)
+            for r in results
+            if r.worktree != merged.worktree
+        ],
         return_exceptions=True,
     )
     await merge_worktree(merged.worktree)
@@ -989,7 +1127,10 @@ def run(
     try:
         result = asyncio.run(_run_async(cfg, pool, task))
         # show final result in header (concise)
-        ui.set_header(ui.header + f" | Final result: {result[:SUMMARY_MAX_LEN]}{'...' if len(result) > SUMMARY_MAX_LEN else ''}")
+        ui.set_header(
+            ui.header
+            + f" | Final result: {result[:SUMMARY_MAX_LEN]}{'...' if len(result) > SUMMARY_MAX_LEN else ''}"
+        )
     finally:
         ui.stop()
 
